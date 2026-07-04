@@ -58,6 +58,11 @@ class LODClassifierSettings(PropertyGroup):
         min=20,
         max=1200,
     )
+    incremental_mode: BoolProperty(
+        name="Incremental Mode",
+        description="Reuse prior pair scores when meshes are unchanged",
+        default=True,
+    )
     cancel_requested: BoolProperty(name="Cancel Requested", default=False, options={"HIDDEN"})
     is_running: BoolProperty(name="Is Running", default=False, options={"HIDDEN"})
     progress_percent: IntProperty(name="Progress", default=0, min=0, max=100, subtype="PERCENTAGE")
@@ -97,6 +102,7 @@ class LODCLASSIFIER_OT_ClassifyScene(Operator):
             min_vertex_ratio=settings.min_vertex_ratio,
             sample_count=settings.sample_count,
             fast_prefilter=settings.fast_prefilter,
+            incremental_mode=settings.incremental_mode,
         )
 
         self._pipeline = LODClassifierPipeline(settings=pipeline_settings)
@@ -168,6 +174,8 @@ class LODCLASSIFIER_OT_ClassifyScene(Operator):
                 "mesh_count": result.report.mesh_count,
                 "candidate_count": result.report.candidate_count,
                 "comparison_count": result.report.comparison_count,
+                "compared_pairs": result.compared_pair_count,
+                "reused_pairs": result.reused_pair_count,
                 "cluster_count": len(result.clusters),
                 "copy_count": sum(len(items) for items in result.renamed.values()),
             }

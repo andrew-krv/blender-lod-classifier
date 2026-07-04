@@ -41,6 +41,7 @@ Candidate Filter:
 Performance:
 - Surface Samples
 - Fast Prefilter
+- Incremental Mode
 - Tick Budget
 
 Output Copies:
@@ -55,6 +56,8 @@ Progress:
 - Copy mode duplicates objects and mesh data; no linked instances are created.
 - Originals remain untouched.
 - If Create Renamed Copies is disabled, no scene objects are changed.
+- Incremental Mode reuses pair scores for unchanged meshes to speed up repeated runs.
+- Cache automatically refreshes when mesh signatures or analyzer-impacting settings change.
 
 ## Runtime Verification
 

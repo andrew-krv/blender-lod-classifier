@@ -48,6 +48,7 @@ class VIEW3D_PT_LODClassifier(Panel):
         col.label(text="Performance")
         col.prop(settings, "sample_count")
         col.prop(settings, "fast_prefilter")
+        col.prop(settings, "incremental_mode")
         col.prop(settings, "tick_budget")
 
         col.separator()
@@ -81,6 +82,8 @@ class VIEW3D_PT_LODClassifier(Panel):
             box.label(text=f"Meshes: {summary.get('mesh_count', 0)}")
             box.label(text=f"Candidates: {summary.get('candidate_count', 0)}")
             box.label(text=f"Comparisons: {summary.get('comparison_count', 0)}")
+            box.label(text=f"Compared: {summary.get('compared_pairs', 0)}")
+            box.label(text=f"Reused: {summary.get('reused_pairs', 0)}")
             box.label(text=f"Clusters: {summary.get('cluster_count', 0)}")
             box.label(text=f"Copies: {summary.get('copy_count', 0)}")
 

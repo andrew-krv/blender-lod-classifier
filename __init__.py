@@ -7,7 +7,7 @@ from typing import Any
 bl_info = {
     "name": "LOD Classifier",
     "author": "LOD Classifier Contributors",
-    "version": (0, 3, 0),
+    "version": (0, 4, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > LOD Classifier",
     "description": "Recover probable LOD groups from imported meshes.",

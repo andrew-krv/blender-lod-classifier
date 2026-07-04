@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -41,6 +42,7 @@ class PipelineSettings:
     sample_count: int = 32
     fast_prefilter: bool = True
     fast_prefilter_floor: float = 0.55
+    incremental_mode: bool = True
 
 
 @dataclass
@@ -50,6 +52,8 @@ class PipelineResult:
     report: ClassificationReport
     clusters: list[Cluster]
     renamed: dict[str, list[str]]
+    compared_pair_count: int = 0
+    reused_pair_count: int = 0
 
 
 @dataclass
@@ -70,6 +74,14 @@ class _PipelineSession:
     mesh_infos: list[MeshInfo]
     ordered_meshes: list[MeshInfo]
     mesh_by_name: dict[str, MeshInfo]
+    mesh_signatures: dict[str, str]
+    dirty_mesh_names: set[str]
+    incremental_reuse: bool
+    settings_signature: str
+    reused_pair_count: int
+    compared_pair_count: int
+    cached_pair_scores: dict[tuple[str, str], float]
+    cached_details_map: dict[tuple[str, str], dict[str, float]]
     fingerprints: dict[str, dict[str, Fingerprint]]
     candidates: list[tuple[MeshInfo, MeshInfo]]
     pair_scores: dict[tuple[str, str], float]
@@ -115,11 +127,39 @@ class LODClassifierPipeline:
         mesh_infos = self.database.build(context)
         mesh_by_name = {m.mesh_name: m for m in mesh_infos}
         ordered_meshes = sorted(mesh_infos, key=lambda m: max(float(m.estimated_volume), 1e-12))
+
+        mesh_signatures = {mesh.mesh_name: self._mesh_signature(mesh) for mesh in mesh_infos}
+        settings_signature = self._settings_signature()
+        cache_blob = self._load_incremental_cache(context.scene)
+
+        can_reuse = (
+            self.settings.incremental_mode
+            and cache_blob.get("settings_signature", "") == settings_signature
+        )
+
+        previous_signatures = cache_blob.get("mesh_signatures", {}) if can_reuse else {}
+        dirty_mesh_names = {
+            name
+            for name, signature in mesh_signatures.items()
+            if previous_signatures.get(name) != signature
+        }
+
+        cached_pair_scores = self._decode_pair_scores(cache_blob.get("pair_scores", {})) if can_reuse else {}
+        cached_details_map = self._decode_pair_details(cache_blob.get("pair_details", {})) if can_reuse else {}
+
         return _PipelineSession(
             context=context,
             mesh_infos=mesh_infos,
             ordered_meshes=ordered_meshes,
             mesh_by_name=mesh_by_name,
+            mesh_signatures=mesh_signatures,
+            dirty_mesh_names=dirty_mesh_names,
+            incremental_reuse=can_reuse,
+            settings_signature=settings_signature,
+            reused_pair_count=0,
+            compared_pair_count=0,
+            cached_pair_scores=cached_pair_scores,
+            cached_details_map=cached_details_map,
             fingerprints={},
             candidates=[],
             pair_scores={},
@@ -179,7 +219,20 @@ class LODClassifierPipeline:
                     continue
 
                 if self.candidate_filter._passes(mesh_a, mesh_b):
-                    session.candidates.append((mesh_a, mesh_b))
+                    key = tuple(sorted((mesh_a.mesh_name, mesh_b.mesh_name)))
+                    can_reuse_pair = (
+                        session.incremental_reuse
+                        and mesh_a.mesh_name not in session.dirty_mesh_names
+                        and mesh_b.mesh_name not in session.dirty_mesh_names
+                        and key in session.cached_pair_scores
+                    )
+                    if can_reuse_pair:
+                        session.pair_scores[key] = session.cached_pair_scores[key]
+                        if key in session.cached_details_map:
+                            session.details_map[key] = session.cached_details_map[key]
+                        session.reused_pair_count += 1
+                    else:
+                        session.candidates.append((mesh_a, mesh_b))
 
                 session.candidate_checked += 1
                 ops += 1
@@ -194,7 +247,7 @@ class LODClassifierPipeline:
 
             message = (
                 f"Candidate filter: checked {session.candidate_checked}/{total_pairs} pairs, "
-                f"kept {len(session.candidates)}"
+                f"compare {len(session.candidates)}, reused {session.reused_pair_count}"
             )
             return PipelineProgress(done=False, cancelled=False, value=self._progress_value(session), message=message)
 
@@ -230,6 +283,7 @@ class LODClassifierPipeline:
                 session.pair_scores[key] = score
                 session.details_map[key] = details
                 session.compare_index += 1
+                session.compared_pair_count += 1
 
             if session.compare_index >= total:
                 session.stage = "clustering"
@@ -267,6 +321,9 @@ class LODClassifierPipeline:
                 value=self._progress_value(session),
                 message=f"Created copies: {created_count}",
             )
+
+        if session.stage == "done":
+            return PipelineProgress(done=True, cancelled=False, value=9999, message="Done")
 
         return PipelineProgress(done=True, cancelled=False, value=9999, message="Done")
 
@@ -322,7 +379,15 @@ class LODClassifierPipeline:
             renamed=session.renamed,
         )
 
-        return PipelineResult(report=report, clusters=session.clusters, renamed=session.renamed)
+        self._save_incremental_cache(session)
+
+        return PipelineResult(
+            report=report,
+            clusters=session.clusters,
+            renamed=session.renamed,
+            compared_pair_count=session.compared_pair_count,
+            reused_pair_count=session.reused_pair_count,
+        )
 
     def _progress_value(self, session: _PipelineSession) -> int:
         """Compute monotonic 0..9999 value from staged pipeline progress."""
@@ -345,6 +410,118 @@ class LODClassifierPipeline:
         if session.stage == "renaming":
             return 9700
         return 9999
+
+    def _mesh_signature(self, mesh: MeshInfo) -> str:
+        """Return a stable signature used to detect mesh changes between runs."""
+
+        dims = mesh.bounding_box_dimensions
+        return "|".join(
+            (
+                str(mesh.vertex_count),
+                str(mesh.face_count),
+                str(mesh.edge_count),
+                f"{dims[0]:.6f}",
+                f"{dims[1]:.6f}",
+                f"{dims[2]:.6f}",
+                f"{mesh.surface_area:.6f}",
+                f"{mesh.estimated_volume:.6f}",
+            )
+        )
+
+    def _settings_signature(self) -> str:
+        """Return cache signature for settings affecting pair scores."""
+
+        payload = {
+            "min_dimension_ratio": self.settings.min_dimension_ratio,
+            "min_volume_ratio": self.settings.min_volume_ratio,
+            "min_vertex_ratio": self.settings.min_vertex_ratio,
+            "sample_count": self.settings.sample_count,
+            "fast_prefilter": self.settings.fast_prefilter,
+            "fast_prefilter_floor": self.settings.fast_prefilter_floor,
+        }
+        return json.dumps(payload, sort_keys=True)
+
+    def _load_incremental_cache(self, scene: Any) -> dict[str, Any]:
+        """Load scene-scoped incremental cache blob."""
+
+        raw = scene.get("lod_classifier_incremental_cache", "")
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_incremental_cache(self, session: _PipelineSession) -> None:
+        """Persist cache for next run in scene custom properties."""
+
+        valid_names = set(session.mesh_by_name.keys())
+        pair_scores = {
+            self._pair_key_to_string(key): value
+            for key, value in session.pair_scores.items()
+            if key[0] in valid_names and key[1] in valid_names
+        }
+        pair_details = {
+            self._pair_key_to_string(key): value
+            for key, value in session.details_map.items()
+            if key[0] in valid_names and key[1] in valid_names
+        }
+
+        payload = {
+            "settings_signature": session.settings_signature,
+            "mesh_signatures": session.mesh_signatures,
+            "pair_scores": pair_scores,
+            "pair_details": pair_details,
+        }
+        session.context.scene["lod_classifier_incremental_cache"] = json.dumps(payload)
+
+    def _decode_pair_scores(self, serialized: dict[str, Any]) -> dict[tuple[str, str], float]:
+        """Decode serialized pair score map."""
+
+        decoded: dict[tuple[str, str], float] = {}
+        for key, value in serialized.items():
+            pair = self._pair_key_from_string(key)
+            if pair is None:
+                continue
+            try:
+                decoded[pair] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return decoded
+
+    def _decode_pair_details(self, serialized: dict[str, Any]) -> dict[tuple[str, str], dict[str, float]]:
+        """Decode serialized analyzer-detail map."""
+
+        decoded: dict[tuple[str, str], dict[str, float]] = {}
+        for key, value in serialized.items():
+            pair = self._pair_key_from_string(key)
+            if pair is None or not isinstance(value, dict):
+                continue
+
+            item: dict[str, float] = {}
+            for detail_key, detail_value in value.items():
+                try:
+                    item[str(detail_key)] = float(detail_value)
+                except (TypeError, ValueError):
+                    continue
+            decoded[pair] = item
+        return decoded
+
+    def _pair_key_to_string(self, key: tuple[str, str]) -> str:
+        """Serialize tuple pair key."""
+
+        return f"{key[0]}|{key[1]}"
+
+    def _pair_key_from_string(self, key: str) -> tuple[str, str] | None:
+        """Parse tuple pair key from serialized form."""
+
+        if "|" not in key:
+            return None
+        a, b = key.split("|", 1)
+        if not a or not b:
+            return None
+        return tuple(sorted((a, b)))
 
     def _quick_similarity(
         self,
