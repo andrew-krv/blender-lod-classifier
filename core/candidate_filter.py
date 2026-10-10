@@ -13,7 +13,7 @@ class CandidateFilter:
 
     min_dimension_ratio: float = 0.45
     min_volume_ratio: float = 0.25
-    min_vertex_ratio: float = 0.15
+    min_vertex_ratio: float = 0.02
 
     def _ratio(self, a: float, b: float) -> float:
         if a <= 0.0 and b <= 0.0:

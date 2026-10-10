@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import exp, log
 
 from ..core.mesh_info import MeshInfo
 from ..fingerprints.fingerprint import Fingerprint
@@ -12,7 +13,13 @@ from .analyzer import Analyzer
 
 @dataclass
 class CompositeAnalyzer:
-    """Builds per-analyzer fingerprints and computes weighted similarity."""
+    """Builds per-analyzer fingerprints and computes weighted similarity.
+
+    Scores are combined as a weighted product ``prod(score ** weight)``: every analyzer acts
+    as a penalty factor and the weight is its strictness exponent. Unlike an average, analyzers
+    that trivially agree (same bbox) cannot dilute one that disagrees (different shape).
+    Analyzers with zero weight are still evaluated and reported in details.
+    """
 
     analyzers: list[Analyzer]
 
@@ -24,7 +31,7 @@ class CompositeAnalyzer:
     def similarity(self, fp_a: dict[str, Fingerprint], fp_b: dict[str, Fingerprint]) -> tuple[float, dict[str, float]]:
         """Compute weighted similarity and return analyzer-level details."""
 
-        weighted_sum = 0.0
+        log_sum = 0.0
         weight_total = 0.0
         details: dict[str, float] = {}
 
@@ -36,10 +43,12 @@ class CompositeAnalyzer:
 
             score = clamp01(analyzer.similarity(a, b))
             details[analyzer.name] = score
-            weighted_sum += score * analyzer.weight
+            if analyzer.weight <= 0.0:
+                continue
+            log_sum += analyzer.weight * log(max(score, 1e-6))
             weight_total += analyzer.weight
 
         if weight_total == 0.0:
             return 0.0, details
 
-        return clamp01(weighted_sum / weight_total), details
+        return clamp01(exp(log_sum)), details

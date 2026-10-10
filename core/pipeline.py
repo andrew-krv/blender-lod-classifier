@@ -9,15 +9,17 @@ from typing import Any, Callable
 from ..analyzers.bbox import BoundingBoxAnalyzer
 from ..analyzers.composite import CompositeAnalyzer
 from ..analyzers.normals import NormalDistributionAnalyzer
-from ..analyzers.sample import SurfaceSampleAnalyzer
+from ..analyzers.parts import PartStructureAnalyzer
 from ..analyzers.topology import TopologyAnalyzer
 from ..analyzers.volume import VolumeAnalyzer
+from ..analyzers.voxel import VoxelAnalyzer
 from ..fingerprints.fingerprint import Cluster
 from ..fingerprints.fingerprint import Fingerprint
 from ..utils.cache import SimpleCache
 from ..utils.logging import get_logger
 from .candidate_filter import CandidateFilter
 from .clustering import SimilarityClusterer
+from .duplicates import DuplicateDetector
 from .lod_detector import VertexCountLODDetector
 from .mesh_database import MeshDatabase
 from .mesh_info import MeshInfo
@@ -32,14 +34,17 @@ CancelCallback = Callable[[], bool]
 class PipelineSettings:
     """Configurable runtime settings for classification."""
 
-    cluster_threshold: float = 0.75
-    include_singletons: bool = False
+    cluster_threshold: float = 0.7
+    include_singletons: bool = True
+    source_collection: str = ""
     rename_meshes: bool = False
-    rename_template: str = "mesh_{cluster:03d}_vtx_{vertices}_lod_{lod}"
+    rename_template: str = "mesh_{cluster:03d}"
     min_dimension_ratio: float = 0.45
     min_volume_ratio: float = 0.25
-    min_vertex_ratio: float = 0.15
-    sample_count: int = 32
+    min_vertex_ratio: float = 0.02
+    voxel_resolution: int = 32
+    collapse_duplicates: bool = True
+    linkage: str = "average"
     fast_prefilter: bool = True
     fast_prefilter_floor: float = 0.55
     incremental_mode: bool = True
@@ -75,6 +80,7 @@ class _PipelineSession:
     ordered_meshes: list[MeshInfo]
     mesh_by_name: dict[str, MeshInfo]
     mesh_signatures: dict[str, str]
+    duplicates: dict[str, list[str]]
     dirty_mesh_names: set[str]
     incremental_reuse: bool
     settings_signature: str
@@ -112,21 +118,34 @@ class LODClassifierPipeline:
         self.composite = CompositeAnalyzer(
             analyzers=[
                 BoundingBoxAnalyzer(),
-                TopologyAnalyzer(),
-                SurfaceSampleAnalyzer(sample_count=settings.sample_count),
+                PartStructureAnalyzer(),
+                VoxelAnalyzer(resolution=settings.voxel_resolution),
                 NormalDistributionAnalyzer(),
                 VolumeAnalyzer(),
+                TopologyAnalyzer(),
             ]
         )
-        self.clusterer = SimilarityClusterer()
+        self.duplicate_detector = DuplicateDetector()
+        self.clusterer = SimilarityClusterer(linkage=settings.linkage)
         self.lod_detector = VertexCountLODDetector()
 
     def start(self, context: Any) -> _PipelineSession:
         """Create incremental execution session for the active scene."""
 
-        mesh_infos = self.database.build(context)
+        mesh_infos = self.database.build(
+            context,
+            collection_name=self.settings.source_collection,
+            exclude_collection_name=MeshRenamer.root_collection_name,
+        )
         mesh_by_name = {m.mesh_name: m for m in mesh_infos}
-        ordered_meshes = sorted(mesh_infos, key=lambda m: max(float(m.estimated_volume), 1e-12))
+
+        # Only one representative per group of identical meshes takes part in comparisons.
+        duplicates = self.duplicate_detector.group_exact(mesh_infos) if self.settings.collapse_duplicates else {}
+        duplicate_names = {name for names in duplicates.values() for name in names}
+        ordered_meshes = sorted(
+            (m for m in mesh_infos if m.mesh_name not in duplicate_names),
+            key=lambda m: max(float(m.estimated_volume), 1e-12),
+        )
 
         mesh_signatures = {mesh.mesh_name: self._mesh_signature(mesh) for mesh in mesh_infos}
         settings_signature = self._settings_signature()
@@ -153,6 +172,7 @@ class LODClassifierPipeline:
             ordered_meshes=ordered_meshes,
             mesh_by_name=mesh_by_name,
             mesh_signatures=mesh_signatures,
+            duplicates=duplicates,
             dirty_mesh_names=dirty_mesh_names,
             incremental_reuse=can_reuse,
             settings_signature=settings_signature,
@@ -191,10 +211,10 @@ class LODClassifierPipeline:
             return PipelineProgress(done=True, cancelled=False, value=9999, message="Not enough meshes")
 
         if session.stage == "fingerprints":
-            total = len(session.mesh_infos)
+            total = len(session.ordered_meshes)
             target = min(total, session.fingerprint_index + max_operations)
             while session.fingerprint_index < target:
-                mesh = session.mesh_infos[session.fingerprint_index]
+                mesh = session.ordered_meshes[session.fingerprint_index]
                 session.fingerprints[mesh.mesh_name] = self.composite.build(mesh)
                 session.fingerprint_index += 1
 
@@ -207,6 +227,8 @@ class LODClassifierPipeline:
             mesh_count = len(session.ordered_meshes)
             total_pairs = (mesh_count * (mesh_count - 1)) // 2
             ops = 0
+            if mesh_count < 2:
+                session.stage = "comparisons"
             while ops < max_operations and session.candidate_i < mesh_count - 1:
                 mesh_a = session.ordered_meshes[session.candidate_i]
                 mesh_b = session.ordered_meshes[session.candidate_j]
@@ -292,9 +314,23 @@ class LODClassifierPipeline:
             return PipelineProgress(done=False, cancelled=False, value=self._progress_value(session), message=message)
 
         if session.stage == "clustering":
+            if self.settings.collapse_duplicates:
+                session.duplicates = self.duplicate_detector.merge_near(
+                    session.duplicates,
+                    session.mesh_by_name,
+                    session.details_map,
+                )
+            duplicate_names = {name for names in session.duplicates.values() for name in names}
+            representatives = [m for m in session.mesh_infos if m.mesh_name not in duplicate_names]
+            representative_scores = {
+                key: score
+                for key, score in session.pair_scores.items()
+                if key[0] not in duplicate_names and key[1] not in duplicate_names
+            }
+
             session.clusters = self.clusterer.build_clusters(
-                meshes=session.mesh_infos,
-                pair_scores=session.pair_scores,
+                meshes=representatives,
+                pair_scores=representative_scores,
                 threshold=self.settings.cluster_threshold,
                 include_singletons=self.settings.include_singletons,
             )
@@ -303,7 +339,7 @@ class LODClassifierPipeline:
                 cluster.ordered_lods = self.lod_detector.order_cluster(cluster, session.mesh_by_name)
 
             session.stage = "renaming" if self.settings.rename_meshes else "done"
-            message = f"Clusters found: {len(session.clusters)}"
+            message = f"Clusters found: {len(session.clusters)}, duplicates collapsed: {len(duplicate_names)}"
             return PipelineProgress(done=False, cancelled=False, value=self._progress_value(session), message=message)
 
         if session.stage == "renaming":
@@ -353,6 +389,9 @@ class LODClassifierPipeline:
                     for name in cluster.members
                     if name in session.mesh_by_name
                 },
+                "duplicates": {
+                    name: session.duplicates[name] for name in cluster.members if name in session.duplicates
+                },
                 "pair_scores": {
                     f"{a}|{b}": session.pair_scores[(a, b)]
                     for i, a in enumerate(cluster.members)
@@ -377,6 +416,7 @@ class LODClassifierPipeline:
             threshold=self.settings.cluster_threshold,
             clusters=report_clusters,
             renamed=session.renamed,
+            duplicates=session.duplicates,
         )
 
         self._save_incremental_cache(session)
@@ -392,7 +432,7 @@ class LODClassifierPipeline:
     def _progress_value(self, session: _PipelineSession) -> int:
         """Compute monotonic 0..9999 value from staged pipeline progress."""
 
-        mesh_total = max(1, len(session.mesh_infos))
+        mesh_total = max(1, len(session.ordered_meshes))
         pair_total = max(1, (mesh_total * (mesh_total - 1)) // 2)
         compare_total = max(1, len(session.candidates))
 
@@ -425,6 +465,7 @@ class LODClassifierPipeline:
                 f"{dims[2]:.6f}",
                 f"{mesh.surface_area:.6f}",
                 f"{mesh.estimated_volume:.6f}",
+                mesh.geometry_hash,
             )
         )
 
@@ -435,9 +476,10 @@ class LODClassifierPipeline:
             "min_dimension_ratio": self.settings.min_dimension_ratio,
             "min_volume_ratio": self.settings.min_volume_ratio,
             "min_vertex_ratio": self.settings.min_vertex_ratio,
-            "sample_count": self.settings.sample_count,
+            "voxel_resolution": self.settings.voxel_resolution,
             "fast_prefilter": self.settings.fast_prefilter,
             "fast_prefilter_floor": self.settings.fast_prefilter_floor,
+            "analyzers": [(a.name, a.version, a.weight) for a in self.composite.analyzers],
         }
         return json.dumps(payload, sort_keys=True)
 
@@ -531,9 +573,9 @@ class LODClassifierPipeline:
         """Fast prefilter based only on cheap analyzers."""
 
         bbox = self._analyzer_score("bbox", fp_a, fp_b)
-        topology = self._analyzer_score("topology", fp_a, fp_b)
-        details = {"bbox": bbox, "topology": topology}
-        return (0.6 * bbox + 0.4 * topology), details
+        volume = self._analyzer_score("volume", fp_a, fp_b)
+        details = {"bbox": bbox, "volume": volume}
+        return (bbox**0.6) * (volume**0.4), details
 
     def _analyzer_score(
         self,

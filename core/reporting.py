@@ -20,6 +20,7 @@ class ClassificationReport:
     threshold: float
     clusters: list[dict[str, Any]] = field(default_factory=list)
     renamed: dict[str, list[str]] = field(default_factory=dict)
+    duplicates: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return report as plain dictionary."""
@@ -32,6 +33,7 @@ class ClassificationReport:
             "threshold": self.threshold,
             "clusters": self.clusters,
             "renamed": self.renamed,
+            "duplicates": self.duplicates,
         }
 
     def to_json(self) -> str:
@@ -44,7 +46,7 @@ class ClassificationReport:
 
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["cluster_id", "confidence", "member", "lod_index", "vertex_count"])
+        writer.writerow(["cluster_id", "confidence", "member", "lod_index", "vertex_count", "duplicates"])
 
         for cluster in self.clusters:
             ordered = cluster.get("ordered_lods", [])
@@ -57,6 +59,7 @@ class ClassificationReport:
                         member,
                         lod_index,
                         vertices.get(member),
+                        ";".join(self.duplicates.get(member, [])),
                     ]
                 )
 

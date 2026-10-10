@@ -12,13 +12,16 @@ class BoundingBoxAnalyzer(Analyzer):
     """Compares dimensions and aspect ratios as a coarse geometry signal."""
 
     name = "bbox"
-    version = "1"
-    weight = 0.1
+    version = "2"
+    weight = 0.5
 
     def build(self, mesh: MeshInfo) -> Fingerprint:
         """Create bounding-box dimensions and aspect-ratio fingerprint."""
 
-        w, h, d = mesh.bounding_box_dimensions
+        dims = mesh.bounding_box_dimensions
+        # Floor flat axes so near-planar meshes (cards, decals) do not explode the ratios.
+        floor = 0.01 * sum(v * v for v in dims) ** 0.5
+        w, h, d = (max(v, floor) for v in dims)
         payload = {
             "dims": (w, h, d),
             "ratios": (

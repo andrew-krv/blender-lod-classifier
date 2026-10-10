@@ -9,11 +9,15 @@ from .analyzer import Analyzer
 
 
 class TopologyAnalyzer(Analyzer):
-    """Compares vertex, face, and edge counts to infer LOD relation."""
+    """Compares vertex, face, and edge counts.
+
+    LODs differ in counts by design, so this is reported for diagnostics but carries no
+    weight in the default composite score.
+    """
 
     name = "topology"
     version = "1"
-    weight = 0.1
+    weight = 0.0
 
     def build(self, mesh: MeshInfo) -> Fingerprint:
         """Create count-based topology fingerprint."""

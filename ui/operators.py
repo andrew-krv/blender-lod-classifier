@@ -6,11 +6,11 @@ import json
 from pathlib import Path
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import Operator, PropertyGroup, Scene
 
 from ..core.pipeline import LODClassifierPipeline, PipelineSettings
-from ..core.renamer import MeshRenamer
+from ..core.renamer import MeshRenamer, is_sorted_copy
 
 
 def _scene_report_key() -> str:
@@ -24,27 +24,51 @@ def _scene_summary_key() -> str:
 class LODClassifierSettings(PropertyGroup):
     """User-configurable addon settings."""
 
-    cluster_threshold: FloatProperty(name="Threshold", default=0.75, min=0.0, max=1.0)
-    include_singletons: BoolProperty(name="Include Singletons", default=False)
+    cluster_threshold: FloatProperty(name="Threshold", default=0.7, min=0.0, max=1.0)
+    include_singletons: BoolProperty(
+        name="Include Singletons",
+        description="Also copy unique meshes that have no other LODs (as <name>_lod0)",
+        default=True,
+    )
+    source_collection: PointerProperty(
+        name="Collection",
+        description="Only classify meshes in this collection (and its children). Empty = whole scene",
+        type=bpy.types.Collection,
+    )
+    collapse_duplicates: BoolProperty(
+        name="Collapse Duplicates",
+        description="Treat meshes with identical geometry as one; only the representative is clustered and copied",
+        default=True,
+    )
+    linkage: EnumProperty(
+        name="Linkage",
+        description="How groups are merged",
+        items=(
+            ("average", "Average", "Merge only when the mean similarity over all cross pairs passes the threshold"),
+            ("single", "Single", "Merge on any single pair above the threshold (prone to chaining)"),
+        ),
+        default="average",
+    )
     rename_meshes: BoolProperty(
         name="Create Renamed Copies",
         description="Create duplicated objects with LOD names. Original meshes are not renamed",
         default=True,
     )
     rename_template: StringProperty(
-        name="Rename Template",
-        description="Template used only for naming created copies",
-        default="mesh_{cluster:03d}_vtx_{vertices}_lod_{lod}",
+        name="Family Name Template",
+        description="Base name for new families ({cluster}, {vertices} of LOD0). '_lod<N>' is appended. "
+        "Families inherit names you gave their copies in earlier runs",
+        default="mesh_{cluster:03d}",
     )
     min_dimension_ratio: FloatProperty(name="Min Dim Ratio", default=0.45, min=0.0, max=1.0)
     min_volume_ratio: FloatProperty(name="Min Volume Ratio", default=0.25, min=0.0, max=1.0)
-    min_vertex_ratio: FloatProperty(name="Min Vertex Ratio", default=0.15, min=0.0, max=1.0)
-    sample_count: IntProperty(
-        name="Surface Samples",
-        description="Lower values are faster but less accurate",
-        default=24,
+    min_vertex_ratio: FloatProperty(name="Min Vertex Ratio", default=0.02, min=0.0, max=1.0)
+    voxel_resolution: IntProperty(
+        name="Voxel Resolution",
+        description="Shape comparison grid size. Lower values are faster but less accurate",
+        default=32,
         min=8,
-        max=128,
+        max=64,
     )
     fast_prefilter: BoolProperty(
         name="Fast Prefilter",
@@ -95,18 +119,27 @@ class LODCLASSIFIER_OT_ClassifyScene(Operator):
         pipeline_settings = PipelineSettings(
             cluster_threshold=settings.cluster_threshold,
             include_singletons=settings.include_singletons,
+            source_collection=settings.source_collection.name if settings.source_collection else "",
             rename_meshes=settings.rename_meshes,
             rename_template=settings.rename_template,
+            collapse_duplicates=settings.collapse_duplicates,
+            linkage=settings.linkage,
             min_dimension_ratio=settings.min_dimension_ratio,
             min_volume_ratio=settings.min_volume_ratio,
             min_vertex_ratio=settings.min_vertex_ratio,
-            sample_count=settings.sample_count,
+            voxel_resolution=settings.voxel_resolution,
             fast_prefilter=settings.fast_prefilter,
             incremental_mode=settings.incremental_mode,
         )
 
         self._pipeline = LODClassifierPipeline(settings=pipeline_settings)
-        self._session = self._pipeline.start(context)
+        try:
+            self._session = self._pipeline.start(context)
+        except ValueError as exc:
+            settings.is_running = False
+            settings.progress_message = str(exc)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         self._last_message = ""
 
         wm = context.window_manager
@@ -177,6 +210,7 @@ class LODCLASSIFIER_OT_ClassifyScene(Operator):
                 "compared_pairs": result.compared_pair_count,
                 "reused_pairs": result.reused_pair_count,
                 "cluster_count": len(result.clusters),
+                "duplicate_count": sum(len(items) for items in result.report.duplicates.values()),
                 "copy_count": sum(len(items) for items in result.renamed.values()),
             }
         )
@@ -282,14 +316,15 @@ class LODCLASSIFIER_OT_ExportCsv(Operator):
             return {"CANCELLED"}
 
         data = json.loads(report_json)
-        rows = ["cluster_id,confidence,member,lod_index,vertex_count"]
+        rows = ["cluster_id,confidence,member,lod_index,vertex_count,duplicates"]
+        duplicates = data.get("duplicates", {})
 
         for cluster in data.get("clusters", []):
             ordered = cluster.get("ordered_lods", [])
             vertex_counts = cluster.get("vertex_counts", {})
             for lod_index, member in enumerate(ordered):
                 rows.append(
-                    f"{cluster.get('cluster_id')},{cluster.get('confidence')},{member},{lod_index},{vertex_counts.get(member, '')}"
+                    f"{cluster.get('cluster_id')},{cluster.get('confidence')},{member},{lod_index},{vertex_counts.get(member, '')},{';'.join(duplicates.get(member, []))}"
                 )
 
         path = Path(self.filepath)
@@ -312,6 +347,57 @@ class LODCLASSIFIER_OT_ClearReport(Operator):
         context.scene.pop(_scene_report_key(), None)
         context.scene.pop(_scene_summary_key(), None)
         self.report({"INFO"}, "LOD report cleared")
+        return {"FINISHED"}
+
+
+class LODCLASSIFIER_OT_PropagateName(Operator):
+    """Rename every LOD copy in the active object's family to its base name, keeping _lod<N> suffixes"""
+
+    bl_idname = "lod_classifier.propagate_name"
+    bl_label = "Propagate Name to Family"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and is_sorted_copy(obj)
+
+    def execute(self, context):
+        renamed = MeshRenamer().propagate_family_name(context.active_object)
+        self.report({"INFO"}, f"Renamed family: {', '.join(renamed)}")
+        return {"FINISHED"}
+
+
+class LODCLASSIFIER_OT_BuildLodCollections(Operator):
+    """Move all sorted copies into LOD0..LODN collections based on their _lod<N> name suffix"""
+
+    bl_idname = "lod_classifier.build_lod_collections"
+    bl_label = "Build LOD Collections"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        counts = MeshRenamer().build_level_collections(context)
+        if not counts:
+            self.report({"WARNING"}, "No sorted copies found. Run Scan / Classify first.")
+            return {"CANCELLED"}
+        summary = ", ".join(f"LOD{lod}: {count}" for lod, count in counts.items())
+        self.report({"INFO"}, f"Built LOD collections ({summary})")
+        return {"FINISHED"}
+
+
+class LODCLASSIFIER_OT_DeleteCopies(Operator):
+    """Delete all copies created by the sorter (originals are untouched)"""
+
+    bl_idname = "lod_classifier.delete_copies"
+    bl_label = "Delete Copies"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        count = MeshRenamer().delete_copies()
+        self.report({"INFO"}, f"Deleted {count} sorted copies")
         return {"FINISHED"}
 
 
@@ -341,6 +427,9 @@ classes = (
     LODCLASSIFIER_OT_ExportCsv,
     LODCLASSIFIER_OT_ClearReport,
     LODCLASSIFIER_OT_ShowRuntimeInfo,
+    LODCLASSIFIER_OT_PropagateName,
+    LODCLASSIFIER_OT_BuildLodCollections,
+    LODCLASSIFIER_OT_DeleteCopies,
 )
 
 

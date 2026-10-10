@@ -35,8 +35,11 @@ class VIEW3D_PT_LODClassifier(Panel):
 
         col = layout.column(align=True)
         col.label(text="Pipeline")
+        col.prop(settings, "source_collection")
         col.prop(settings, "cluster_threshold")
         col.prop(settings, "include_singletons")
+        col.prop(settings, "collapse_duplicates")
+        col.prop(settings, "linkage")
 
         col.separator()
         col.label(text="Candidate Filter")
@@ -46,7 +49,7 @@ class VIEW3D_PT_LODClassifier(Panel):
 
         col.separator()
         col.label(text="Performance")
-        col.prop(settings, "sample_count")
+        col.prop(settings, "voxel_resolution")
         col.prop(settings, "fast_prefilter")
         col.prop(settings, "incremental_mode")
         col.prop(settings, "tick_budget")
@@ -54,9 +57,9 @@ class VIEW3D_PT_LODClassifier(Panel):
         col.separator()
         col.label(text="Output Copies")
         col.prop(settings, "rename_meshes", text="Create Renamed Copies (Keep Originals)")
-        col.prop(settings, "rename_template", text="Copy Name Template")
-        col.label(text="Original meshes are never renamed")
-        col.label(text="Copies are grouped under LOD_Clusters")
+        col.prop(settings, "rename_template")
+        col.label(text="Originals are never renamed; only unique meshes are copied")
+        col.label(text="Re-running replaces copies and keeps names you gave them")
 
         row = layout.row(align=True)
         row.operator("lod_classifier.classify_scene", icon="VIEWZOOM")
@@ -66,6 +69,12 @@ class VIEW3D_PT_LODClassifier(Panel):
         progress_box.label(text="Progress")
         progress_box.prop(settings, "progress_percent", slider=True)
         progress_box.label(text=settings.progress_message)
+
+        box = layout.box()
+        box.label(text="Sorted Copies")
+        box.operator("lod_classifier.propagate_name", icon="SORTALPHA")
+        box.operator("lod_classifier.build_lod_collections", icon="OUTLINER_COLLECTION")
+        box.operator("lod_classifier.delete_copies", icon="TRASH")
 
         row = layout.row(align=True)
         row.operator("lod_classifier.export_json", icon="EXPORT")
@@ -85,6 +94,7 @@ class VIEW3D_PT_LODClassifier(Panel):
             box.label(text=f"Compared: {summary.get('compared_pairs', 0)}")
             box.label(text=f"Reused: {summary.get('reused_pairs', 0)}")
             box.label(text=f"Clusters: {summary.get('cluster_count', 0)}")
+            box.label(text=f"Duplicates: {summary.get('duplicate_count', 0)}")
             box.label(text=f"Copies: {summary.get('copy_count', 0)}")
 
 

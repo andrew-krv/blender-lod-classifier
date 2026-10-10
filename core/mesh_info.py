@@ -5,15 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, eq=False)
 class MeshInfo:
     """Represents immutable geometry information for one mesh object."""
 
     object_ref: Any
     mesh_name: str
-    vertices: tuple[tuple[float, float, float], ...]
-    triangles: tuple[tuple[int, int, int], ...]
+    vertices: np.ndarray  # (N, 3) float64, local space
+    triangles: np.ndarray  # (T, 3) int64
     vertex_count: int
     face_count: int
     edge_count: int
@@ -24,3 +26,4 @@ class MeshInfo:
     estimated_volume: float
     materials: tuple[str, ...]
     transform_matrix: tuple[tuple[float, float, float, float], ...]
+    geometry_hash: str = ""
